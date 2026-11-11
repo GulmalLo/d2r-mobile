@@ -1,4 +1,5 @@
-// 掉落过滤（用原版自带的战利品过滤器，不自造一套）：按难度自动选档——普通难度不藏、噩梦「轻筛」、地狱（秘境只在地狱开）「重筛」。
+// 掉落过滤（用原版自带的战利品过滤器，不自造一套）：按难度自动选档——普通难度不藏、噩梦「轻度」、地狱「标准」，也可以在
+// <存档>/Settings/dm-lootfilter.txt 里写死用哪一份（含「严格」）。
 // 原版的机制（Switch 版主程序里完整存在，只是暂停菜单里的入口被我们的布局藏着）：
 //   · 规则文件 <存档>/Settings/<配置名>.fltr 在启动时全部载入；<存档>/Settings/lootfilter.json 的 Profiles 段记「角色名 → 配置名」，
 //     每次进局收到自己的玩家单位时重读一次这个文件、按角色名选当前配置（main+0x464130 → 0x382280 → 0x381d10）。
@@ -7,31 +8,44 @@
 //   · 一条规则里：非装备看 itemCategory（界面类别名，父类 misc 含全部子类）或 itemCode（物品三字码）；装备看 equipmentRarity（稀有度）、
 //     equipmentQuality（普通 / 扩展 / 精英档，只对分档的类别有效——戒指项链护身符珠宝头环不分档）、equipmentCategory / equipmentItemCode。
 //     投掷药水算装备（武器），要用 equipmentItemCode 点名（实测：写在 itemCode 里藏不住）。
-// 宿主做的事：挂存档时把四份规则文件写进 Settings/（原版只在启动时载入规则文件，所以要赶在那之前）；之后主线程每半秒看一眼
-// 「现在该用哪一份」（难度、开关、身上有没有弓弩），和过滤器对象里的「当前配置名」不一样就改过去。
+// 本文件的做法：规则内容不再在这里拼字符串，改成 fltr.py 生成好的 6 份 JSON（dm_lootfilter_data.h 内嵌），挂存档时整份写进 Settings/。
+// 六份 = 轻度 / 标准 / 严格 ×（藏箭矢 / 身上有弓弩不藏箭矢）；内容是「类似 PC 端屏蔽」的那一套：藏杂物、低级药水、卷轴与书、
+// 投掷药水、劣质装备；标准档起再藏普通档的白装与蓝装，但无形 / 带孔、职业专属、头环、饰品一律留着；严格档把这些放宽到全档位，
+// 并藏掉普通档的暗金与绿装。符文、宝石、护身符、珠宝、任务物品、金币、钥匙从不提，因此永远可见。
+// 选哪一份：默认按难度（普通不藏、噩梦轻度、地狱标准）；<存档>/Settings/dm-lootfilter.txt 里写 profile=<配置名> 可写死
+// （也认 auto / off，或你自己放进 Settings/ 的任何 <名字>.fltr —— 原版启动时全部载入，名字 15 字节以内即可）。
+// 宿主做的事：挂存档时把所有规则文件写进 Settings/（原版只在启动时载入规则文件，所以要赶在那之前）；之后主线程每半秒看一眼
+// 「现在该用哪一份」（配置 / 难度 / 开关 / 身上有没有弓弩），和过滤器对象里的「当前配置名」不一样就改过去。
 // 当前配置名 = 过滤器对象 main+0x2d58520 的 +0x20：原版自己的字符串（+0 字符指针、+8 长度、+0x10 容量，最高位是标志；15 字以内存在对象自带的缓冲里）。
-// 判定函数每次都按这个名字去已载入的配置里查（0x37d5fc），所以改名字即时生效；我们的名字都不超过 10 个字符，只在现有容量够时原地改写。
+// 判定函数每次都按这个名字去已载入的配置里查（0x37d5fc），所以改名字即时生效；我们的名字都不超过 15 个字符，只在现有容量够时原地改写。
 // lootfilter.json 不碰：实测原版只在启动时读它一次，进局时用的是内存里那份「角色 → 配置」，改文件不管用；进局时原版按它把名字设回去，下一次巡检再改过来。
 // 身上装着弓 / 弩（含副手那套）时箭矢弩矢不藏，局中换上 / 卸下弓半秒内跟着变。
-// 开关：「自定义」设置 loot_filter（缺省开 = 按难度自动；关 = 全显示）。测试强制：DM_LOOTFILTER=off / lite / heavy。
-// Loot filter (uses the game's built-in loot filter rather than building our own): the tier is picked by difficulty: nothing hidden on Normal, "lite" on Nightmare, "heavy" on Hell (Greater Rifts only open on Hell).
-// The game's mechanism (fully present in the Switch main executable; only its pause-menu entry is hidden by our layout):
-//   · Rule files <save>/Settings/<profile name>.fltr are all loaded at startup; the Profiles section of <save>/Settings/lootfilter.json records "character name → profile name",
-//     and each time a game is entered and our own player unit arrives, this file is re-read and the current profile chosen by character name (main+0x464130 → 0x382280 → 0x381d10).
-//   · The check main+0x37f3d4(filter main+0x2d58520, item) returns 1 visible / 0 hidden, with only three call sites in the whole image: two for ground name labels (no label is built),
-//     one for the controller's per-frame target pick (the primary button will not pick it up). Only active in Reign of the Warlock mode (mode gate at the top of the function). Any matching "show" rule makes it visible; otherwise it is hidden only if a "hide" rule matches.
-//   · Within a rule: non-equipment goes by itemCategory (UI category name; parent misc includes all subcategories) or itemCode (three-letter item code); equipment goes by equipmentRarity (rarity),
-//     equipmentQuality (normal / exceptional / elite tier, only valid for tiered categories: rings, amulets, charms, jewels and circlets have no tiers), equipmentCategory / equipmentItemCode.
-//     Throwing potions count as equipment (weapons) and must be named with equipmentItemCode (measured: putting them in itemCode does not hide them).
-// What the host does: on save mount, write the four rule files into Settings/ (the game only loads rule files at startup, so it must happen before that); after that the main thread looks every half second at
-// "which one should be in use now" (difficulty, switch, bow or crossbow equipped) and changes the filter object's "current profile name" if it differs.
-// Current profile name = +0x20 of the filter object main+0x2d58520: the game's own string (+0 char pointer, +8 length, +0x10 capacity, top bit is a flag; up to 15 chars live in the object's inline buffer).
-// The check looks the name up among the loaded profiles every time (0x37d5fc), so changing the name takes effect at once; our names are all at most 10 characters, and we only rewrite in place when the existing capacity is enough.
-// lootfilter.json is not touched: measured, the game reads it only once at startup and on entering a game uses the in-memory "character → profile" map, so editing the file does nothing; on entry the game sets the name back from that map, and the next poll changes it again.
-// With a bow / crossbow equipped (including the off-hand set) arrows and bolts are not hidden; equipping / removing a bow mid-game is followed within half a second.
-// Switch: "Custom" setting loot_filter (default on = automatic by difficulty; off = show everything). Test override: DM_LOOTFILTER=off / lite / heavy.
+// 开关：「自定义」设置 loot_filter（缺省开 = 按难度自动；关 = 全显示；dm-lootfilter.txt 写了 profile 时以文件为准）。
+// 测试强制：DM_LOOTFILTER=off / lite / std / strict，DM_LOOTFILTER_PROFILE=<配置名>。
+//
+// Loot filter (uses the game's built-in loot filter rather than building our own): the tier is picked by difficulty — nothing hidden on
+// Normal, "lite" on Nightmare, "standard" on Hell — and a profile can also be pinned in <save>/Settings/dm-lootfilter.txt.
+// The rule bodies are no longer formatted here: six ready-made JSON profiles generated by fltr.py are embedded in
+// dm_lootfilter_data.h and written into Settings/ when the save is mounted. Six = lite / standard / strict × (hide arrows / keep them
+// while a bow is equipped). Content mirrors a PC-style hide filter: junk potions, low healing/mana potions, scrolls and tomes, throwing
+// potions, low-quality gear; from standard on, normal-tier white and magic items are hidden too, while ethereal/socketed, class-specific,
+// circlet and accessory items are always kept; strict widens that to all tiers and also hides normal-tier unique and set items. Runes,
+// gems, charms, jewels, quest items, gold and keys are never mentioned, so they are always visible.
+// Which one: difficulty by default; a profile written in <save>/Settings/dm-lootfilter.txt (profile=<name>, also accepts auto / off, or any
+// <name>.fltr you copy into Settings/ yourself — the game loads every rule file at startup, names must fit 15 bytes).
+// What the host does: on save mount, write all rule files into Settings/ (the game only loads rule files at startup, so it must happen
+// before that); after that the main thread looks every half second at "which one should be in use now" (config, difficulty, switch, bow or
+// crossbow equipped) and changes the filter object's "current profile name" if it differs.
+// Current profile name = +0x20 of the filter object main+0x2d58520: the game's own string (+0 char pointer, +8 length, +0x10 capacity, top
+// bit is a flag; up to 15 chars live in the object's inline buffer). The check looks the name up among the loaded profiles every time
+// (0x37d5fc), so changing the name takes effect at once; our names are all at most 12 characters, and we only rewrite in place when the
+// existing capacity is enough. lootfilter.json is not touched. With a bow / crossbow equipped (including the off-hand set) arrows and
+// bolts are not hidden; equipping / removing a bow mid-game is followed within half a second.
+// Switch: "Custom" setting loot_filter (default on = automatic by difficulty; off = show everything; a pinned profile wins over the switch).
+// Test override: DM_LOOTFILTER=off / lite / std / strict, DM_LOOTFILTER_PROFILE=<name>.
 #include "dm.h"
 #include "dm_custom.h"
+#include "dm_lootfilter_data.h"
 #include <dirent.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -42,43 +56,110 @@
 #define T_MISSILE 47   // 物品类型表行号：miss（弓、弩、亚马逊弓的父类型） | item type table row: miss (parent type of bows, crossbows, Amazon bows)
 int dm_diag_difficulty(void);
 
-// 轻筛藏：精力 / 解毒 / 解冻药，红蓝药最低两档，回城与鉴定的卷轴和书，全部投掷药，低质量（破损 / 粗糙）装备，箭矢弩矢（没装弓弩时）。
-// 重筛再藏：红蓝药第三档；普通档的白装（带孔 / 无形的留着，头环不分档整类留着）；普通档的蓝装（饰品、头环、各职业专属留着）。
-// 任何档都不藏：紫药、钥匙、暗金、套装、稀有、符文、宝石、护身符、珠宝、任务物品与各种材料、金币——规则里压根不提它们。
-// Lite hides: Stamina / Antidote / Thawing potions, the two lowest tiers of Healing and Mana potions, Town Portal and Identify scrolls and tomes, all throwing potions, low quality (Cracked / Crude) gear, arrows and bolts (when no bow or crossbow is equipped).
-// Heavy also hides: the third tier of Healing and Mana potions; normal-tier white items (socketed / ethereal ones are kept, circlets have no tiers and are kept as a whole); normal-tier magic items (jewelry, circlets and class-specific items are kept).
-// Never hidden at any tier: Rejuvenation potions, keys, Unique, Set, Rare, runes, gems, charms, jewels, quest items and all kinds of materials, gold. The rules simply never mention them.
-static void write_fltr(const char *dir, const char *name, int heavy, int ammo) {
+// 各档位藏什么（生成规则见 fltr.py；这里只留一份给人看的摘要）：
+//   轻度：精力 / 解毒 / 解冻药，红蓝药最低两档，回城与鉴定的卷轴和书，全部投掷药，低质量（破损 / 粗糙）装备，箭矢弩矢（没装弓弩时）。
+//   标准：再加红蓝药第三档；普通档的白装与蓝装（无形 / 带孔、职业专属、头环、饰品留着）。
+//   严格：白装与蓝装放宽到全部档位；普通档的暗金与绿装也藏（基本是占屏幕的）。
+//   任何档都不藏：紫药、钥匙、暗金（普通档除外）、套装（普通档除外）、稀有、符文、宝石、护身符、珠宝、任务物品与各种材料、金币。
+// What each tier hides (the generated rules live in fltr.py; this is just a human summary):
+//   Lite: Stamina / Antidote / Thawing potions, the two lowest tiers of Healing and Mana potions, Town Portal and Identify scrolls and
+//   tomes, all throwing potions, low quality gear, arrows and bolts (when no bow or crossbow is equipped).
+//   Standard: also the third tier of Healing and Mana potions; normal-tier white and magic items (ethereal / socketed, class-specific,
+//   circlet and accessory items are kept).
+//   Strict: white and magic items at every tier; normal-tier unique and set items as well.
+//   Never hidden at any tier: Rejuvenation potions, keys, Unique (except normal tier), Set (except normal tier), Rare, runes, gems,
+//   charms, jewels, quest items and all kinds of materials, gold.
+
+// 写一份规则文件：先写 .tmp 再改名，写坏不留下半份
+// Write one rule file: write .tmp first and rename, so a failure never leaves half a file
+static void write_blob(const char *dir, const char *name, const char *json, size_t len) {
     char p[1300], t[1320]; snprintf(p, sizeof p, "%s/%s.fltr", dir, name); snprintf(t, sizeof t, "%s.tmp", p);
-    FILE *f = fopen(t, "w"); if (!f) { LOG("【红】掉落过滤：规则文件写不了 %s", p); return; }
-    fprintf(f, "{\n \"name\": \"%s\",\n \"rules\": [\n", name);
-    fprintf(f, "  {\"name\": \"HIDE consumables\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"itemCode\": [\"vps\", \"yps\", \"wms\", \"hp1\", \"hp2\", \"mp1\", \"mp2\", %s\"tsc\", \"isc\", \"tbk\", \"ibk\"]},\n", heavy ? "\"hp3\", \"mp3\", " : "");
-    fprintf(f, "  {\"name\": \"HIDE throwing potions\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"equipmentItemCode\": [\"gps\", \"gpm\", \"gpl\", \"ops\", \"opm\", \"opl\"]},\n");
-    if (ammo) fprintf(f, "  {\"name\": \"HIDE ammo\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"itemCategory\": [\"ammo\"]},\n");
-    if (heavy) {
-        fprintf(f, "  {\"name\": \"SHOW socketed or ethereal\", \"enabled\": true, \"ruleType\": \"show\", \"filterEtherealSocketed\": true},\n");
-        fprintf(f, "  {\"name\": \"SHOW normal circlets\", \"enabled\": true, \"ruleType\": \"show\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"normal\", \"hiQuality\"], \"equipmentCategory\": [\"circl\"]},\n");
-        fprintf(f, "  {\"name\": \"SHOW magic accessories\", \"enabled\": true, \"ruleType\": \"show\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"magic\"], \"equipmentCategory\": [\"acce\"]},\n");
-        fprintf(f, "  {\"name\": \"SHOW magic circlets\", \"enabled\": true, \"ruleType\": \"show\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"magic\"], \"equipmentCategory\": [\"circl\"]},\n");
-        fprintf(f, "  {\"name\": \"SHOW magic class items\", \"enabled\": true, \"ruleType\": \"show\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"magic\"], \"equipmentCategory\": [\"barbh\", \"druid\", \"palad\", \"necro\", \"warlo\", \"amazo\", \"assas\", \"sorce\"]},\n");
-        fprintf(f, "  {\"name\": \"HIDE normal-tier white and magic\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"normal\", \"hiQuality\", \"magic\"], \"equipmentQuality\": [\"normal\"]},\n"); }
-    fprintf(f, "  {\"name\": \"HIDE low quality\", \"enabled\": true, \"ruleType\": \"hide\", \"filterEtherealSocketed\": false, \"equipmentRarity\": [\"lowQuality\"]}\n ]\n}\n");
-    int ok = fclose(f) == 0 && rename(t, p) == 0; if (!ok) LOG("【红】掉落过滤：规则文件没写成 %s", p);
+    FILE *f = fopen(t, "wb"); if (!f) { LOG("【红】掉落过滤：规则文件写不了 %s", p); return; }
+    int ok = fwrite(json, 1, len, f) == len;
+    ok = (fclose(f) == 0) && ok && rename(t, p) == 0;
+    if (!ok) LOG("【红】掉落过滤：规则文件没写成 %s", p);
 }
-// 四份：轻 / 重 ×（藏箭矢 / 身上有弓弩不藏箭矢）。挂存档时调（hle_fs.c），内容是固定的，每次启动重写一遍（规则改了老存档也跟上）
-// Four files: lite / heavy × (hide arrows / do not hide arrows with a bow or crossbow equipped). Called on save mount (hle_fs.c); the contents are fixed and rewritten on every launch (so old saves follow rule changes)
+
+static char g_dir[1024];   // 存档目录（挂存档时记下，读 dm-lootfilter.txt 要用） | save dir, remembered on mount for dm-lootfilter.txt
+static char g_choice[24];  // dm-lootfilter.txt 里的 profile："" = 没写（按难度）/ "off" = 不过滤 / 其它 = 配置名 | pinned profile
+static int g_choice_loaded;
+
+// 挂存档时调（hle_fs.c）：把内嵌的六份规则文件全部写进 Settings/。内容是固定的，每次启动重写一遍（规则改了老存档也跟上）
+// Called on save mount (hle_fs.c): write all six embedded rule files into Settings/. Contents are fixed and rewritten on every launch
+// (so old saves follow rule changes)
 void dm_lootfilter_seed(const char *save_dir) {
+    snprintf(g_dir, sizeof g_dir, "%s", save_dir);
     char d[1100]; snprintf(d, sizeof d, "%s/Settings", save_dir); mkdir(d, 0755);
-    write_fltr(d, "DmLite", 0, 1); write_fltr(d, "DmLiteBow", 0, 0); write_fltr(d, "DmHeavy", 1, 1); write_fltr(d, "DmHeavyBow", 1, 0);
+    for (int i = 0; i < DM_LF_BLOB_COUNT; i++) {
+        const char *j = dm_lf_blobs[i].json;
+        write_blob(d, dm_lf_blobs[i].name, j, strlen(j));
+    }
 }
 __attribute__((constructor)) static void lootfilter_hook_install(void) { extern void (*g_dm_mount_seed_hook)(const char *); g_dm_mount_seed_hook = dm_lootfilter_seed; }
-static const char *want(int bow, int *why_diff) {   // 现在该用哪一份；"" = 不过滤 | which one should be in use now; "" = no filtering
+
+// 配置名只认字母数字和 _ - .，且不超过 15 字节（原版当前配置名只有 15 字节的内联缓冲）；不合格就忽略，不把怪名字塞进游戏
+// A profile name may only use A-Z a-z 0-9 _ - . and fit 15 bytes (the game's current-profile-name buffer holds 15); anything else is ignored
+static int valid_name(const char *s) {
+    size_t n = strlen(s); if (!n || n > 15) return 0;
+    for (size_t i = 0; i < n; i++) { char c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) return 0; }
+    return 1;
+}
+
+// 读 <存档>/Settings/dm-lootfilter.txt：一行一个「键 = 值」，# 开头是注释。只认 profile 这一项。
+// Reads <save>/Settings/dm-lootfilter.txt: one "key = value" per line, # starts a comment. Only the profile key is used.
+static void load_choice(void) {
+    g_choice_loaded = 1; g_choice[0] = 0;
+    if (!g_dir[0]) return;
+    char p[1100]; snprintf(p, sizeof p, "%s/Settings/dm-lootfilter.txt", g_dir);
+    FILE *f = fopen(p, "rb"); if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char *s = line; while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == '\r' || *s == '\n' || !*s) continue;
+        char *eq = strchr(s, '='); if (!eq) continue;
+        *eq = 0; char *k = s, *v = eq + 1;
+        char *ke = k + strlen(k); while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = 0;
+        while (*v == ' ' || *v == '\t') v++;
+        char *ve = v + strlen(v); while (ve > v && (ve[-1] == '\r' || ve[-1] == '\n' || ve[-1] == ' ' || ve[-1] == '\t')) *--ve = 0;
+        if (*v == '"' || *v == '\'') { char q = *v++; size_t n = strlen(v); if (n && v[n - 1] == q) v[n - 1] = 0; }
+        if (strcmp(k, "profile")) continue;   // 其它键留给以后 | other keys are reserved for later
+        if (!*v || !strcmp(v, "auto")) g_choice[0] = 0;
+        else if (!strcmp(v, "off")) snprintf(g_choice, sizeof g_choice, "%s", "off");
+        else if (valid_name(v)) snprintf(g_choice, sizeof g_choice, "%s", v);
+        else LOG("【红】掉落过滤：dm-lootfilter.txt 里的 profile「%s」不是合法配置名（字母数字 _ - .，最多 15 字节），已忽略", v);
+    }
+    fclose(f);
+    if (g_choice[0]) LOG("掉落过滤：dm-lootfilter.txt 指定配置「%s」", g_choice);
+}
+
+// 现在该用哪一份；"" = 不过滤 | which one should be in use now; "" = no filtering
+static const char *want(int bow, int *why_diff) {
+    // 默认档位：难度 0 普通 = 不藏，1 噩梦 = 轻度，2 地狱 = 标准。想固定成别的档位就改下面这一行（0 不藏 / 1 轻度 / 2 标准 / 3 严格）：
+    //   lvl = 3;              → 任何难度都用严格
+    //   lvl = diff ? 2 : 0;   → 普通不藏，噩梦起就用标准
+    // Default tiers: difficulty 0 Normal = nothing hidden, 1 Nightmare = lite, 2 Hell = standard. To pin another tier, change the line
+    // below (0 none / 1 lite / 2 standard / 3 strict):
+    //   lvl = 3;              -> strict on every difficulty
+    //   lvl = diff ? 2 : 0;   -> nothing on Normal, standard from Nightmare on
     int diff = dm_diag_difficulty(), lvl = diff == 1 ? 1 : diff == 2 ? 2 : 0; *why_diff = diff;
     const char *e = getenv("DM_LOOTFILTER");
-    if (e && !strcmp(e, "off")) lvl = 0; else if (e && !strcmp(e, "lite")) lvl = 1; else if (e && !strcmp(e, "heavy")) lvl = 2;
-    else if (!dm_custom_get("loot_filter")) lvl = 0;
-    return lvl == 0 ? "" : lvl == 1 ? (bow ? "DmLiteBow" : "DmLite") : (bow ? "DmHeavyBow" : "DmHeavy");
+    const char *p = getenv("DM_LOOTFILTER_PROFILE");
+    if (p && *p) return p;   // 测试开关：直接点名 | test switch: name it directly
+    if (e && !strcmp(e, "off")) lvl = 0;
+    else if (e && !strcmp(e, "lite")) lvl = 1;
+    else if (e && !strcmp(e, "std")) lvl = 2;
+    else if (e && !strcmp(e, "strict")) lvl = 3;
+    else {
+        if (!g_choice_loaded) load_choice();
+        if (g_choice[0]) return !strcmp(g_choice, "off") ? "" : g_choice;   // 文件写死了就用它 | pinned in the file
+        if (!dm_custom_get("loot_filter")) lvl = 0;
+    }
+    return lvl == 0 ? "" : lvl == 1 ? (bow ? "DmLiteBow" : "DmLite")
+                       : lvl == 2 ? (bow ? "DmStdBow" : "DmStd")
+                                  : (bow ? "DmStrictBow" : "DmStrict");
 }
+
 // 主线程每帧调（dm_potpick.c 的每帧入口带过来；pl = 客户端玩家，不在局内为 0）：每 30 帧核一次当前配置名
 // Called every frame on the main thread (via the per-frame entry in dm_potpick.c; pl = client player, 0 when not in a game): checks the current profile name every 30 frames
 uint64_t dm_guest_frame(void);
